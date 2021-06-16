@@ -1,0 +1,199 @@
+---
+title: "Untitled"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning=FALSE)
+library(tidyverse)
+library(patchwork)
+ephys <- qs::qread(here::here("data-raw", "ephys.qs"))
+```
+
+# Correct only
+
+```{r, data}
+
+color <- ephys %>%
+  filter(correct) %>%
+  group_by(date, color, task, period, region, electrode, unit, id) %>%
+  summarise(
+    firing_rate = mean(firing_rate),
+    N = n(),
+    .groups = "drop") 
+
+
+nrs <- color %>%
+  select(-N) %>%
+  pivot_wider(names_from = task, values_from = firing_rate, names_prefix = "task_") %>%
+  filter(!is.na(task_color), !is.na(task_motion)) %>%
+  group_nest(date, period, region, electrode, unit) %>%
+  rowwise() %>%
+  mutate(nr = nrow(data)) %>%
+  ungroup() 
+```
+
+I've run just a few simple analyses. First, I excluded all neurons that were shown only 1 matching color in each of the motion and color tasks. This excluded some neurons because the activity of many neurons was only recorded when the monkey was shown a single color, or different colors for their motion and color trials. Estimating a slope requires at least 2 colors.
+
+```{r, nrs, fig.cap="Firing rate at all colors is available for most neurons."}
+# distribution of colors available
+nrs %>%
+  ggplot(aes(x=nr)) +
+  facet_wrap(~region) +
+  geom_bar() +
+  xlab("Number of matching colors")
+
+```
+On these filtered data, I then averaged firing rates to prepare for the orthogonal regression. The fMRI data comprised a single beta for each orientation and level of contrast, within a run (stimuli were presented multiple times, but only a single beta was used for all repetitions). So, for the fMRI data it was straightforward to construct pairs of beta values. In contrast, within a single day, monkeys, were asked to do the same task for some combinations of color/motion stimuli repeatedly. So, I averaged all repetitions within a day (results were similar with medians). For many neurons, this average included over 50 trials, although a few neurons had many fewer trials. 
+
+```{r, plottrials, fig.cap="Number of trials for neurons that were shown more than 2 colors."}
+
+color %>%
+  ggplot() +
+  facet_wrap(~region) +
+  geom_histogram(aes(x=N)) +
+  xlab("Number of Trials")
+
+```
+
+```{r estimate_slopes}
+
+slopes <- nrs %>%
+  filter(nr > 1) %>%
+  mutate(
+    value = map(data, ~pracma::odregress(.x$task_color, .x$task_motion)),
+    slope = map_dbl(value, ~.x$coeff[[1]]),
+    intercept = map_dbl(value, ~.x$coeff[[2]]),
+    avg_diff = map_dbl(data, ~mean(.x$task_motion - .x$task_color)),
+    angle = atan2(slope, 1)) %>%
+  select(-data, -value) %>%
+  pivot_longer(c(slope, intercept, angle, avg_diff), names_to = "coeff", values_to = "estimate") %>%
+  mutate(estimate = if_else(coeff == "angle", circular::deg(estimate), estimate))
+
+ang_medians <- slopes %>%
+  filter(coeff == "angle") %>%
+  mutate(
+    estimate = circular::circular(.data$estimate, type="angles", units = "degrees", modulo = "pi")) %>%
+  group_by(coeff, period, region) %>%
+  summarise(
+    med = circular::median.circular(estimate), 
+    .groups = "drop") %>%
+  mutate(med = as.numeric(med))
+
+medians <- slopes %>%
+  filter(!coeff == "angle") %>%
+  group_by(coeff, period, region) %>%
+  summarise(
+    med = median(estimate), 
+    .groups = "drop") %>%
+  bind_rows(ang_medians) %>%
+  mutate(
+    label = glue::glue("{round(med, digits=1)}"),
+    vjust = if_else(region=="V4", 2, 4))
+
+```
+
+Then, I calculated the slope and intercept from orthogonal regression. I did this separately for the activity during the cue period and the sample period. These period were defined by Jefferson: the 'cue' was the second half of the cue period (i.e., a period of 500ms before stimulus onset), and the 'sample' was from 0-280ms after stimulus onset. 
+
+```{r, fig_slopes, fig.cap="Slope and intercept as calculated by orthogonal regression. Note that extreme values have been excluded for visualization.", fig.width=7}
+
+plot_estimate <- function(d, medians, co){
+  medians <- medians %>%
+    filter(coeff=={{co}})
+  d %>%
+    filter(coeff=={{co}}) %>%
+    ggplot() +
+    facet_wrap(~period, ncol=1, strip.position = "right") +
+    geom_histogram(aes(x=estimate, fill=region), position=position_dodge()) +
+    geom_vline(
+      aes(xintercept=med, color=region),
+      linetype="dashed",
+      data = medians) +
+    geom_text(
+      aes(label=label, x=med, color=region, vjust=vjust),
+      y=Inf,
+      hjust = -.4,
+      data = medians) +
+    xlab(rlang::as_name(co))
+}
+
+s <- plot_estimate(slopes, medians, "slope") +
+  xlim(-20, 20) 
+
+i <- plot_estimate(slopes, medians, "intercept") +
+  xlim(-100, 100) 
+
+a <- plot_estimate(slopes, medians, "angle") +
+  xlim(-90, 90)
+
+ad <- plot_estimate(slopes, medians, "avg_diff") 
+
+s + i + a + ad + plot_layout(guides = 'collect') +
+  xlim(-20,20) +
+  ggsave(
+    "parameters.png",
+    height = 7)
+
+```
+
+
+```{r}
+
+ephys %>%
+  nmmr::WISEsummary(
+    dependentvars = "firing_rate",
+    betweenvars = "region",
+    withinvars = c("task", "period", "correct"),
+    idvar = "id") %>%
+  ggplot(aes(x=period, color = task)) +
+  facet_grid(correct~region, labeller = label_both) +
+  geom_errorbar(
+    aes(
+      ymin = firing_rate_CI_lower,
+      ymax = firing_rate_CI_upper),
+    position = position_dodge(),
+    width = 0.6) +
+  ylim(0,NA)
+
+```
+
+
+```{r}
+ephys %>%
+  group_by(id, correct, period, region, task) %>%
+  summarise(
+    sdeviation = sd(firing_rate),
+    .groups = "drop") %>%
+  pivot_wider(names_from = task, values_from = sdeviation) %>%
+  ggplot(aes(x=color, y = motion)) +
+  coord_fixed() +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(aes(color = region), alpha = 0.2) +
+  facet_grid(correct ~ period)
+```
+
+
+
+# Correct vs. Incorrect
+
+```{r}
+
+color <- ephys %>%
+  group_by(date, color, task, period, region, electrode, unit, id, correct) %>%
+  summarise(
+    firing_rate = mean(firing_rate),
+    N = n(),
+    .groups = "drop") 
+
+```
+
+
+```{r}
+
+color %>%
+  ggplot() +
+  facet_grid(correct~region) +
+  geom_histogram(aes(x=N)) +
+  xlab("Number of Trials")
+
+```
